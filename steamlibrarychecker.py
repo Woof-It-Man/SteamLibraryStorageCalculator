@@ -152,6 +152,70 @@ def parse_vdf_output(output):
         return None
 
 
+_raw_depots_cache = {}
+
+
+def fetch_raw_depots(appid, name):
+    """Fetch just the depots dict for an app via steamcmd, with a small
+    in-memory cache since resolving depotfromapp can re-fetch the same
+    parent app many times across a library scan."""
+    if appid in _raw_depots_cache:
+        return _raw_depots_cache[appid]
+
+    depots = None
+    try:
+        result = subprocess.run(
+            [STEAMCMD_PATH, "+login", "anonymous", "+app_info_print", str(appid), "+quit"],
+            capture_output=True, text=True, timeout=STEAMCMD_TIMEOUT,
+        )
+        parsed = parse_vdf_output(result.stdout)
+        if parsed:
+            app_data = next(iter(parsed.values()))
+            depots = app_data.get("depots", {})
+    except Exception as e:
+        log_error(appid, name, f"fetch_raw_depots failed: {e}")
+
+    _raw_depots_cache[appid] = depots
+    return depots
+
+
+def resolve_shared_depot_size(depot_id, parent_appid, name, depth=0):
+    """A depot marked depotfromapp borrows its content from another app's
+    depot of the SAME id. Look that up and return its public manifest size.
+    Follows chained references up to a small depth limit."""
+    if depth > 2:
+        return None
+    parent_depots = fetch_raw_depots(parent_appid, name)
+    if not parent_depots:
+        return None
+    parent_depot = parent_depots.get(str(depot_id))
+    if not isinstance(parent_depot, dict):
+        return None
+    if "depotfromapp" in parent_depot:
+        return resolve_shared_depot_size(depot_id, parent_depot["depotfromapp"], name, depth + 1)
+    manifests = parent_depot.get("manifests", {})
+    if not isinstance(manifests, dict):
+        return None
+    public_manifest = manifests.get("public")
+    if not isinstance(public_manifest, dict):
+        return None
+    size_str = public_manifest.get("size")
+    if size_str is None:
+        return None
+    try:
+        return int(size_str)
+    except (ValueError, TypeError):
+        return None
+
+
+# Tracks depot IDs already counted somewhere in the current scan, so a
+# depotfromapp reference to a depot already counted by its owning game
+# (or by an earlier game that shares it) contributes 0 instead of double-
+# counting disk space that's only actually stored once. Let's hope
+# this fixes the issue with some games coming up as unknown!
+CLAIMED_DEPOT_IDS = set()
+
+
 def get_size_from_steamcmd(appid, name):
     if vdf is None:
         return "NO_VDF_LIB"
@@ -201,9 +265,22 @@ def get_size_from_steamcmd(appid, name):
         for depot_id, depot_block in depots.items():
             if not isinstance(depot_block, dict):
                 continue
-            if "depotfromapp" in depot_block:
-                continue
             if not depot_matches_target(depot_block, target_os):
+                continue
+
+            if "depotfromapp" in depot_block:
+                if depot_id in CLAIMED_DEPOT_IDS:
+                    # Already counted (either by the owning game or another
+                    # game sharing it) - installing it here costs no extra
+                    # disk space, so it contributes 0 to this game's total.
+                    found_any = True
+                    continue
+                size_val = resolve_shared_depot_size(depot_id, depot_block["depotfromapp"], name)
+                if size_val is None:
+                    continue  # couldn't resolve the borrowed depot's size
+                CLAIMED_DEPOT_IDS.add(depot_id)
+                total += size_val
+                found_any = True
                 continue
 
             manifests = depot_block.get("manifests", {})
@@ -220,6 +297,10 @@ def get_size_from_steamcmd(appid, name):
             except (ValueError, TypeError):
                 continue
 
+            if depot_id in CLAIMED_DEPOT_IDS:
+                found_any = True
+                continue
+            CLAIMED_DEPOT_IDS.add(depot_id)
             total += size_val
             found_any = True
 
@@ -421,6 +502,7 @@ class SteamSizeApp(tk.Tk):
 
         self.results = []
         self.stop_requested = False
+        CLAIMED_DEPOT_IDS.clear()
         self.tree.delete(*self.tree.get_children())
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
