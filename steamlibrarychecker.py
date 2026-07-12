@@ -16,13 +16,14 @@ except ImportError:
 
 # If steamcmd is not on your system PATH, set the full path to the executable here,
 # e.g. "/home/you/steamcmd/steamcmd.sh" or r"C:\steamcmd\steamcmd.exe"
-# Just download it from valve's wiki and unpack it then path it to it.
+# Just download it frm valve's wiki and unpack it then path it to it.
 # Leave as "steamcmd" to use whatever is on PATH.
 STEAMCMD_PATH = "steamcmd"
 
 STEAMCMD_CACHE_FILE = "steam_size_cache.json"
 ERROR_LOG_FILE = "steam_size_errors.log"
 AUTOSAVE_CSV = "steam_library_sizes_autosave.csv"
+HIDDEN_GAMES_FILE = "steam_hidden_games.json"
 AUTOSAVE_EVERY_N = 15
 STEAMCMD_TIMEOUT = 90
 MAX_RETRIES = 2
@@ -74,6 +75,22 @@ def load_cache():
 def save_cache(cache):
     with open(STEAMCMD_CACHE_FILE, "w") as f:
         json.dump(cache, f, indent=2)
+
+
+def load_hidden_games():
+    """Returns a set of appid strings the user has marked as hidden in this app."""
+    if os.path.exists(HIDDEN_GAMES_FILE):
+        try:
+            with open(HIDDEN_GAMES_FILE, "r") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, ValueError):
+            return set()
+    return set()
+
+
+def save_hidden_games(hidden_set):
+    with open(HIDDEN_GAMES_FILE, "w") as f:
+        json.dump(sorted(hidden_set), f, indent=2)
 
 
 def determine_target_os(depots):
@@ -230,11 +247,14 @@ class SteamSizeApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Steam Library Size Calculator")
-        self.geometry("760x580")
+        self.geometry("760x600")
         self.resizable(True, True)
 
         self.results = []
         self.stop_requested = False
+        self.hidden_appids = load_hidden_games()
+        self.hide_hidden_var = tk.BooleanVar(value=False)
+        self.search_var = tk.StringVar(value="")
 
         self._build_input_frame()
         self._build_progress_frame()
@@ -268,6 +288,25 @@ class SteamSizeApp(tk.Tk):
         self.retry_btn = ttk.Button(btn_frame, text="Retry Unknowns", command=self.retry_unknowns, state="disabled")
         self.retry_btn.pack(side="left", padx=5)
 
+        self.hide_check = ttk.Checkbutton(
+            btn_frame,
+            text="Hide hidden games from view",
+            variable=self.hide_hidden_var,
+            command=self.refresh_tree,
+        )
+        self.hide_check.pack(side="left", padx=10)
+
+        search_frame = ttk.Frame(frame)
+        search_frame.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
+        ttk.Label(search_frame, text="Search:").pack(side="left", padx=(0, 5))
+        self.search_entry = ttk.Entry(search_frame, width=40, textvariable=self.search_var)
+        self.search_entry.pack(side="left")
+        self.search_var.trace_add("write", lambda *args: self.refresh_tree())
+
+        self.clear_search_btn = ttk.Button(search_frame, text="Clear", command=lambda: self.search_var.set(""))
+        self.clear_search_btn.pack(side="left", padx=5)
+
     def _build_progress_frame(self):
         frame = ttk.Frame(self, padding=10)
         frame.pack(fill="x")
@@ -285,20 +324,62 @@ class SteamSizeApp(tk.Tk):
         frame = ttk.Frame(self, padding=10)
         frame.pack(fill="both", expand=True)
 
-        columns = ("name", "appid", "size")
+        columns = ("name", "appid", "size", "hidden")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings")
         self.tree.heading("name", text="Game", command=lambda: self.sort_by("name"))
         self.tree.heading("appid", text="App ID", command=lambda: self.sort_by("appid"))
         self.tree.heading("size", text="Size", command=lambda: self.sort_by("size"))
-        self.tree.column("name", width=380)
-        self.tree.column("appid", width=100, anchor="center")
-        self.tree.column("size", width=150, anchor="e")
+        self.tree.heading("hidden", text="Hidden")
+        self.tree.column("name", width=350)
+        self.tree.column("appid", width=90, anchor="center")
+        self.tree.column("size", width=140, anchor="e")
+        self.tree.column("hidden", width=60, anchor="center")
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
 
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+        # Right-click context menu for hiding/unhiding games
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Hide", command=self.hide_selected)
+        self.context_menu.add_command(label="Unhide", command=self.unhide_selected)
+
+        self.tree.bind("<Button-3>", self._on_right_click)
+        # macOS often sends Button-2 for right-click on some setups; harmless to bind both
+        self.tree.bind("<Button-2>", self._on_right_click)
+
+    def _on_right_click(self, event):
+        row_id = self.tree.identify_row(event.y)
+        if row_id:
+            self.tree.selection_set(row_id)
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _selected_appids(self):
+        appids = []
+        for item_id in self.tree.selection():
+            values = self.tree.item(item_id, "values")
+            if values:
+                appids.append(str(values[1]))
+        return appids
+
+    def hide_selected(self):
+        appids = self._selected_appids()
+        if not appids:
+            return
+        self.hidden_appids.update(appids)
+        save_hidden_games(self.hidden_appids)
+        self.refresh_tree()
+
+    def unhide_selected(self):
+        appids = self._selected_appids()
+        if not appids:
+            return
+        for a in appids:
+            self.hidden_appids.discard(a)
+        save_hidden_games(self.hidden_appids)
+        self.refresh_tree()
 
     def sort_by(self, key):
         if key == "size":
@@ -312,9 +393,15 @@ class SteamSizeApp(tk.Tk):
     def refresh_tree(self):
         for row in self.tree.get_children():
             self.tree.delete(row)
+        query = self.search_var.get().strip().lower()
         for name, appid, size in self.results:
+            is_hidden = str(appid) in self.hidden_appids
+            if is_hidden and self.hide_hidden_var.get():
+                continue
+            if query and query not in name.lower() and query not in str(appid):
+                continue
             size_str = format_bytes(size) if isinstance(size, int) else "Unknown"
-            self.tree.insert("", "end", values=(name, appid, size_str))
+            self.tree.insert("", "end", values=(name, appid, size_str, "Yes" if is_hidden else ""))
 
     def start_scan(self):
         if vdf is None:
@@ -475,10 +562,11 @@ class SteamSizeApp(tk.Tk):
             writer = csv.writer(f)
             writer.writerow(["Game", "AppID", "Size (bytes)", "Size (formatted)"])
             for name, appid, size in self.results:
+                if str(appid) in self.hidden_appids:
+                    continue  # never export hidden games
                 size_bytes = size if isinstance(size, int) else ""
                 size_fmt = format_bytes(size) if isinstance(size, int) else "Unknown"
                 writer.writerow([name, appid, size_bytes, size_fmt])
-
 
 if __name__ == "__main__":
     app = SteamSizeApp()
