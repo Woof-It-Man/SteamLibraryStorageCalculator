@@ -33,6 +33,7 @@ def log_error(appid, name, message):
     with open(ERROR_LOG_FILE, "a") as f:
         f.write(f"[{datetime.datetime.now().isoformat()}] appid={appid} name={name!r}: {message}\n")
 
+
 def resolve_steamid(api_key, vanity_or_id):
     if vanity_or_id.isdigit() and len(vanity_or_id) == 17:
         return vanity_or_id
@@ -66,10 +67,23 @@ def get_owned_games(api_key, steamid):
 
 
 def load_cache():
+    """
+    Cache format (v2): {"depot_data": {appid_str: {"owned": {depot_id: size},
+    "shared_refs": {depot_id: parent_appid}} or null_on_failure_not_stored}}
+
+    Stores the RAW per-game depot ownership data, not a final computed size.
+    so we have the full data now. Great for debugging lol.
+    """
     if os.path.exists(STEAMCMD_CACHE_FILE):
-        with open(STEAMCMD_CACHE_FILE, "r") as f:
-            return json.load(f)
-    return {}
+        try:
+            with open(STEAMCMD_CACHE_FILE, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            return {"depot_data": {}}
+        if isinstance(data, dict) and "depot_data" in data and isinstance(data["depot_data"], dict):
+            return data
+        return {"depot_data": {}}  # old v1 cache or unrecognized shape - start fresh
+    return {"depot_data": {}}
 
 
 def save_cache(cache):
@@ -113,16 +127,16 @@ def determine_target_os(depots):
         return "linux"
     if "macos" in seen_os:
         return "macos"
-    return None 
+    return None
 
 
 def depot_matches_target(depot_block, target_os):
     config = depot_block.get("config", {})
     oslist = config.get("oslist", "")
     if not oslist:
-        return True  
+        return True
     if target_os is None:
-        return True  
+        return True
     allowed = [o.strip() for o in oslist.split(",")]
     return target_os in allowed
 
@@ -152,71 +166,24 @@ def parse_vdf_output(output):
         return None
 
 
-_raw_depots_cache = {}
+def fetch_depot_data(appid, name):
+    """
+    Query steamcmd for an app's depots and extract raw ownership data -
+    WITHOUT resolving depotfromapp references or doing any cross-game
+    dedup. That happens later, cheaply, in compute_totals().
 
-
-def fetch_raw_depots(appid, name):
-    """Fetch just the depots dict for an app via steamcmd, with a small
-    in-memory cache since resolving depotfromapp can re-fetch the same
-    parent app many times across a library scan."""
-    if appid in _raw_depots_cache:
-        return _raw_depots_cache[appid]
-
-    depots = None
-    try:
-        result = subprocess.run(
-            [STEAMCMD_PATH, "+login", "anonymous", "+app_info_print", str(appid), "+quit"],
-            capture_output=True, text=True, timeout=STEAMCMD_TIMEOUT,
-        )
-        parsed = parse_vdf_output(result.stdout)
-        if parsed:
-            app_data = next(iter(parsed.values()))
-            depots = app_data.get("depots", {})
-    except Exception as e:
-        log_error(appid, name, f"fetch_raw_depots failed: {e}")
-
-    _raw_depots_cache[appid] = depots
-    return depots
-
-
-def resolve_shared_depot_size(depot_id, parent_appid, name, depth=0):
-    """A depot marked depotfromapp borrows its content from another app's
-    depot of the SAME id. Look that up and return its public manifest size.
-    Follows chained references up to a small depth limit."""
-    if depth > 2:
-        return None
-    parent_depots = fetch_raw_depots(parent_appid, name)
-    if not parent_depots:
-        return None
-    parent_depot = parent_depots.get(str(depot_id))
-    if not isinstance(parent_depot, dict):
-        return None
-    if "depotfromapp" in parent_depot:
-        return resolve_shared_depot_size(depot_id, parent_depot["depotfromapp"], name, depth + 1)
-    manifests = parent_depot.get("manifests", {})
-    if not isinstance(manifests, dict):
-        return None
-    public_manifest = manifests.get("public")
-    if not isinstance(public_manifest, dict):
-        return None
-    size_str = public_manifest.get("size")
-    if size_str is None:
-        return None
-    try:
-        return int(size_str)
-    except (ValueError, TypeError):
-        return None
-
-
-# Tracks depot IDs already counted somewhere in the current scan, so a
-# depotfromapp reference to a depot already counted by its owning game
-# (or by an earlier game that shares it) contributes 0 instead of double-
-# counting disk space that's only actually stored once. Let's hope
-# this fixes the issue with some games coming up as unknown!
-CLAIMED_DEPOT_IDS = set()
-
-
-def get_size_from_steamcmd(appid, name):
+    Returns one of:
+      "NO_VDF_LIB" / "NO_STEAMCMD"  - environment errors
+      None                          - fetch/parse failed after retries (a
+                                       real transient failure; not cached,
+                                       so a future retry will try again)
+      {"owned": {depot_id: size}, "shared_refs": {depot_id: parent_appid}}
+                                       - success (possibly with empty dicts
+                                       if the app genuinely has no usable
+                                       depot data at all, e.g. a delisted
+                                       demo/tool app.  This IS cached, since
+                                       it's a confirmed answer, not a failure.)
+    """
     if vdf is None:
         return "NO_VDF_LIB"
 
@@ -236,10 +203,9 @@ def get_size_from_steamcmd(appid, name):
         except FileNotFoundError:
             return "NO_STEAMCMD"
 
-        output = result.stdout
-        parsed = parse_vdf_output(output)
+        parsed = parse_vdf_output(result.stdout)
         if not parsed:
-            last_error = f"attempt {attempt}: could not parse steamcmd output (len={len(output)} chars)"
+            last_error = f"attempt {attempt}: could not parse steamcmd output (len={len(result.stdout)} chars)"
             log_error(appid, name, last_error)
             time.sleep(1)
             continue
@@ -253,14 +219,11 @@ def get_size_from_steamcmd(appid, name):
             continue
 
         if not depots:
-            last_error = f"attempt {attempt}: no 'depots' section found in app info"
-            log_error(appid, name, last_error)
-            return None  # legitimately no depot info (e.g. delisted/unavailable app)
+            return {"owned": {}, "shared_refs": {}}
 
         target_os = determine_target_os(depots)
-
-        total = 0
-        found_any = False
+        owned = {}
+        shared_refs = {}
 
         for depot_id, depot_block in depots.items():
             if not isinstance(depot_block, dict):
@@ -269,18 +232,7 @@ def get_size_from_steamcmd(appid, name):
                 continue
 
             if "depotfromapp" in depot_block:
-                if depot_id in CLAIMED_DEPOT_IDS:
-                    # Already counted (either by the owning game or another
-                    # game sharing it) - installing it here costs no extra
-                    # disk space, so it contributes 0 to this game's total.
-                    found_any = True
-                    continue
-                size_val = resolve_shared_depot_size(depot_id, depot_block["depotfromapp"], name)
-                if size_val is None:
-                    continue  # couldn't resolve the borrowed depot's size
-                CLAIMED_DEPOT_IDS.add(depot_id)
-                total += size_val
-                found_any = True
+                shared_refs[str(depot_id)] = str(depot_block["depotfromapp"])
                 continue
 
             manifests = depot_block.get("manifests", {})
@@ -297,23 +249,91 @@ def get_size_from_steamcmd(appid, name):
             except (ValueError, TypeError):
                 continue
 
-            if depot_id in CLAIMED_DEPOT_IDS:
-                found_any = True
-                continue
-            CLAIMED_DEPOT_IDS.add(depot_id)
-            total += size_val
-            found_any = True
+            owned[str(depot_id)] = size_val
 
-        if found_any:
-            return total
-        else:
-            last_error = f"attempt {attempt}: depots present but none had usable public manifest sizes (target_os={target_os})"
-            log_error(appid, name, last_error)
-            time.sleep(1)
-            continue
+        return {"owned": owned, "shared_refs": shared_refs}
 
     log_error(appid, name, f"giving up after {MAX_RETRIES} attempts. Last error: {last_error}")
     return None
+
+
+def resolve_via_cache(depot_id, parent_appid, depot_data_cache, ensure_fn, depth=0):
+    """Follow a depotfromapp reference to find the actual size, fetching
+    and caching the parent app's depot data on demand if it isn't already known
+    (e.g. the parent base game isn't owned/scanned itself)."""
+    if depth > 3:
+        return None
+
+    parent_data = depot_data_cache.get(parent_appid)
+    if parent_data is None:
+        parent_data = ensure_fn(parent_appid)
+        if parent_data is None:
+            return None
+        depot_data_cache[parent_appid] = parent_data
+
+    owned = parent_data.get("owned", {})
+    if depot_id in owned:
+        return owned[depot_id]
+
+    shared_refs = parent_data.get("shared_refs", {})
+    if depot_id in shared_refs:
+        return resolve_via_cache(depot_id, shared_refs[depot_id], depot_data_cache, ensure_fn, depth + 1)
+
+    return None
+
+
+def compute_totals(appid_order, depot_data_cache, ensure_fn):
+    """
+    Pure, cheap, in-memory recomputation of every game's install size from
+    already-fetched depot_data, with correct cross-game dedup: whichever
+    game (in appid_order) touches a given depot ID FIRST gets it counted;
+    any later game referencing the same depot ID (whether it owns it
+    directly or borrows it via depotfromapp) contributes 0, since that content
+    is only actually stored on disk once.
+
+    ensure_fn(appid) -> depot_data dict or None; used to lazily fetch data
+    for "parent" apps that show up as depotfromapp targets but aren't
+    otherwise in the scanned library (e.g. an unowned base game).
+
+    Returns {appid: size_in_bytes_or_None}.
+    """
+    claimed = set()
+    totals = {}
+
+    for appid in appid_order:
+        data = depot_data_cache.get(appid)
+        if not isinstance(data, dict):
+            totals[appid] = None
+            continue
+
+        owned = data.get("owned", {})
+        shared_refs = data.get("shared_refs", {})
+
+        total = 0
+        found_any = False
+
+        for depot_id, size in owned.items():
+            if depot_id in claimed:
+                found_any = True
+                continue
+            claimed.add(depot_id)
+            total += size
+            found_any = True
+
+        for depot_id, parent_appid in shared_refs.items():
+            if depot_id in claimed:
+                found_any = True
+                continue
+            resolved_size = resolve_via_cache(depot_id, parent_appid, depot_data_cache, ensure_fn)
+            if resolved_size is None:
+                continue
+            claimed.add(depot_id)
+            total += resolved_size
+            found_any = True
+
+        totals[appid] = total if found_any else None
+
+    return totals
 
 
 def format_bytes(num_bytes):
@@ -328,14 +348,16 @@ class SteamSizeApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Steam Library Size Calculator")
-        self.geometry("760x600")
+        self.geometry("780x620")
         self.resizable(True, True)
 
-        self.results = []
+        self.results = []  # (name, appid, size_or_None)
         self.stop_requested = False
         self.hidden_appids = load_hidden_games()
         self.hide_hidden_var = tk.BooleanVar(value=False)
         self.search_var = tk.StringVar(value="")
+        self.cache = load_cache()
+        self.name_lookup = {}  # appid -> name, used for logging during lazy parent fetches
 
         self._build_input_frame()
         self._build_progress_frame()
@@ -422,10 +444,12 @@ class SteamSizeApp(tk.Tk):
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Right-click context menu for hiding/unhiding games
+        # Right-click context menu for hiding/unhiding/refetching games
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Hide", command=self.hide_selected)
         self.context_menu.add_command(label="Unhide", command=self.unhide_selected)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Purge & Refetch", command=self.purge_and_refetch_selected)
 
         self.tree.bind("<Button-3>", self._on_right_click)
         # macOS often sends Button-2 for right-click on some setups; harmless to bind both
@@ -462,6 +486,65 @@ class SteamSizeApp(tk.Tk):
         save_hidden_games(self.hidden_appids)
         self.refresh_tree()
 
+    def purge_and_refetch_selected(self):
+        """Deletes the selected game(s)' cached depot data and re-fetches
+        them fresh via steamcmd, then recomputes totals for the whole
+        library (cheap, local) so dedup against everything else stays
+        correct. Useful when a specific game's number looks wrong and you
+        don't want to wipe/rescan the whole cache to fix it."""
+        appids = self._selected_appids()
+        if not appids:
+            return
+        if str(self.start_btn["state"]) == "disabled":
+            messagebox.showinfo("Busy", "Please wait for the current scan/retry to finish first.")
+            return
+
+        depot_data_cache = self.cache["depot_data"]
+        for a in appids:
+            depot_data_cache.pop(a, None)
+        save_cache(self.cache)
+
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.retry_btn.config(state="disabled")
+        self.stop_requested = False
+
+        thread = threading.Thread(target=self._purge_and_refetch_worker, args=(appids,), daemon=True)
+        thread.start()
+
+    def _purge_and_refetch_worker(self, appids):
+        appid_order = [appid for _, appid, _ in self.results]
+        depot_data_cache = self.cache["depot_data"]
+
+        for count, appid in enumerate(appids, 1):
+            if self.stop_requested:
+                break
+            name = self.name_lookup.get(appid, f"App {appid}")
+            self.update_status(f"Refetching [{count}/{len(appids)}]: {name}")
+            try:
+                data = fetch_depot_data(appid, name)
+                if isinstance(data, dict):
+                    depot_data_cache[appid] = data
+                    save_cache(self.cache)
+                elif data in ("NO_STEAMCMD", "NO_VDF_LIB"):
+                    error_kind = data
+                    self.update_status(f"ERROR: {error_kind}")
+                    self.after(0, lambda ek=error_kind: messagebox.showerror(
+                        "Environment error",
+                        "steamcmd is not available / on PATH." if ek == "NO_STEAMCMD"
+                        else "pip install vdf --break-system-packages",
+                    ))
+                    break
+            except Exception as e:
+                log_error(appid, name, f"purge/refetch exception: {e}")
+
+        # One full recompute so this game's corrected data properly
+        # dedupes against everything else in the library.
+        self._recompute_and_refresh(appid_order)
+
+        self.update_status("Purge & refetch complete.")
+        self.finish_scan()
+
     def sort_by(self, key):
         if key == "size":
             self.results.sort(key=lambda r: r[2] if isinstance(r[2], int) else -1, reverse=True)
@@ -472,6 +555,9 @@ class SteamSizeApp(tk.Tk):
         self.refresh_tree()
 
     def refresh_tree(self):
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, self.refresh_tree)
+            return
         for row in self.tree.get_children():
             self.tree.delete(row)
         query = self.search_var.get().strip().lower()
@@ -483,6 +569,38 @@ class SteamSizeApp(tk.Tk):
                 continue
             size_str = format_bytes(size) if isinstance(size, int) else "Unknown"
             self.tree.insert("", "end", values=(name, appid, size_str, "Yes" if is_hidden else ""))
+
+    def _ensure_fn(self, appid):
+        """Used by compute_totals to lazily fetch+cache depot data for a
+        parent app that's referenced via depotfromapp but wasn't otherwise
+        part of the scanned library (e.g. an unowned base game)."""
+        name = self.name_lookup.get(appid, f"(dependency of another game, app {appid})")
+        data = fetch_depot_data(appid, name)
+        if isinstance(data, dict):
+            self.cache["depot_data"][appid] = data
+            save_cache(self.cache)
+            return data
+        return None
+
+    def _recompute_and_refresh(self, appid_order):
+        depot_data_cache = self.cache["depot_data"]
+        totals = compute_totals(appid_order, depot_data_cache, self._ensure_fn)
+
+        new_results = []
+        for name, appid, _old_size in self.results:
+            new_results.append((name, appid, totals.get(appid)))
+        self.results = new_results
+
+        total_bytes = sum(s for _, _, s in self.results if isinstance(s, int))
+
+        def _update_ui():
+            self.total_label.config(text=f"Total size so far: {format_bytes(total_bytes)}")
+            self.refresh_tree()
+
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, _update_ui)
+        else:
+            _update_ui()
 
     def start_scan(self):
         if vdf is None:
@@ -502,7 +620,6 @@ class SteamSizeApp(tk.Tk):
 
         self.results = []
         self.stop_requested = False
-        CLAIMED_DEPOT_IDS.clear()
         self.tree.delete(*self.tree.get_children())
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -523,74 +640,88 @@ class SteamSizeApp(tk.Tk):
             self.update_status(f"Resolved SteamID64: {steamid}. Fetching game list...")
             games = get_owned_games(api_key, steamid)
         except Exception as e:
+            error_msg = str(e)
             self.update_status("Error.")
-            messagebox.showerror("Error", str(e))
+            self.after(0, lambda: messagebox.showerror("Error", error_msg))
             self.finish_scan()
             return
 
         total = len(games)
-        self.progress["maximum"] = total
-        self.progress["value"] = 0
 
-        cache = load_cache()
+        def _init_progress():
+            self.progress["maximum"] = total
+            self.progress["value"] = 0
+
+        self.after(0, _init_progress)
+
+        appid_order = []
 
         for i, game in enumerate(games, 1):
             if self.stop_requested:
                 break
-            self.process_one_game(game, i, total, cache)
+            appid = str(game["appid"])
+            name = game.get("name", f"App {appid}")
+            self.name_lookup[appid] = name
+            self.results.append((name, appid, None))  # placeholder, filled in by recompute
+            appid_order.append(appid)
+            self.process_one_game(appid, name, i, total)
+
+            i_captured = i
+            self.after(0, lambda v=i_captured: self.progress.configure(value=v))
+
+            # Cheap, local recompute after every game keeps the running
+            # total live and correctly deduplicated as we go.
+            self._recompute_and_refresh(appid_order)
+
+            if i % AUTOSAVE_EVERY_N == 0:
+                self._write_csv(AUTOSAVE_CSV)
 
         self.update_status("Done." if not self.stop_requested else "Stopped early.")
         self.finish_scan()
 
-    def process_one_game(self, game, i, total, cache):
-        appid = str(game["appid"])
-        name = game.get("name", f"App {appid}")
+    def process_one_game(self, appid, name, i, total):
         self.update_status(f"[{i}/{total}] {name}")
 
+        depot_data_cache = self.cache["depot_data"]
+        if appid in depot_data_cache:
+            return  # already have raw depot data cached; nothing to fetch
+
         try:
-            cached_val = cache.get(appid)
-            if isinstance(cached_val, int):
-                size = cached_val
-            else:
-                size = get_size_from_steamcmd(appid, name)
-                if size == "NO_STEAMCMD":
-                    self.update_status("ERROR: steamcmd not found on PATH.")
-                    messagebox.showerror(
-                        "steamcmd not found",
-                        "steamcmd is not installed, not on your PATH, or STEAMCMD_PATH is set incorrectly.\n\n"
-                        "Install it with:\nsudo add-apt-repository multiverse\n"
-                        "sudo apt update\nsudo apt install steamcmd\n\n"
-                        "Or edit the STEAMCMD_PATH constant near the top of this script "
-                        "to point directly to the steamcmd executable.",
-                    )
-                    self.stop_requested = True
-                    return
-                if size == "NO_VDF_LIB":
-                    self.update_status("ERROR: vdf library not installed.")
-                    messagebox.showerror("Missing dependency", "pip install vdf --break-system-packages")
-                    self.stop_requested = True
-                    return
-                cache[appid] = size
-                save_cache(cache)
-                time.sleep(0.3)
+            data = fetch_depot_data(appid, name)
+            if data == "NO_STEAMCMD":
+                self.update_status("ERROR: steamcmd not found on PATH.")
+                self.after(0, lambda: messagebox.showerror(
+                    "steamcmd not found",
+                    "steamcmd is not installed, not on your PATH, or STEAMCMD_PATH is set incorrectly.\n\n"
+                    "Install it with:\nsudo add-apt-repository multiverse\n"
+                    "sudo apt update\nsudo apt install steamcmd\n\n"
+                    "Or edit the STEAMCMD_PATH constant near the top of this script "
+                    "to point directly to the steamcmd executable.",
+                ))
+                self.stop_requested = True
+                return
+            if data == "NO_VDF_LIB":
+                self.update_status("ERROR: vdf library not installed.")
+                self.after(0, lambda: messagebox.showerror("Missing dependency", "pip install vdf --break-system-packages"))
+                self.stop_requested = True
+                return
+            if isinstance(data, dict):
+                depot_data_cache[appid] = data
+                save_cache(self.cache)
+            time.sleep(0.3)
         except Exception as e:
             log_error(appid, name, f"unexpected exception: {e}")
-            size = None
-
-        self.results.append((name, appid, size))
-        self.progress["value"] = i
-
-        total_bytes = sum(s for _, _, s in self.results if isinstance(s, int))
-        self.total_label.config(text=f"Total size so far: {format_bytes(total_bytes)}")
-        self.refresh_tree()
-
-        if i % AUTOSAVE_EVERY_N == 0:
-            self._write_csv(AUTOSAVE_CSV)
 
     def update_status(self, text):
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, lambda: self.update_status(text))
+            return
         self.status_label.config(text=text)
 
     def finish_scan(self):
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, self.finish_scan)
+            return
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.export_btn.config(state="normal" if self.results else "disabled")
@@ -608,26 +739,30 @@ class SteamSizeApp(tk.Tk):
         thread.start()
 
     def _retry_unknowns_worker(self):
-        cache = load_cache()
         unknown_indices = [idx for idx, (_, _, s) in enumerate(self.results) if not isinstance(s, int)]
         total = len(unknown_indices)
+        appid_order = [appid for _, appid, _ in self.results]
 
         for count, idx in enumerate(unknown_indices, 1):
             if self.stop_requested:
                 break
             name, appid, _ = self.results[idx]
             self.update_status(f"Retrying [{count}/{total}]: {name}")
-            try:
-                size = get_size_from_steamcmd(appid, name)
-                if isinstance(size, int):
-                    cache[appid] = size
-                    save_cache(cache)
-                    self.results[idx] = (name, appid, size)
-            except Exception as e:
-                log_error(appid, name, f"retry exception: {e}")
-            self.refresh_tree()
-            total_bytes = sum(s for _, _, s in self.results if isinstance(s, int))
-            self.total_label.config(text=f"Total size so far: {format_bytes(total_bytes)}")
+            depot_data_cache = self.cache["depot_data"]
+            if appid not in depot_data_cache:
+                try:
+                    data = fetch_depot_data(appid, name)
+                    if isinstance(data, dict):
+                        depot_data_cache[appid] = data
+                        save_cache(self.cache)
+                except Exception as e:
+                    log_error(appid, name, f"retry exception: {e}")
+
+        # One cheap, local recompute over the WHOLE library - not just the
+        # retried games - so any newly-available parent data (fetched above,
+        # or already cached from a prior run) gets correctly applied to
+        # every game's dedup, not just the ones just retried.
+        self._recompute_and_refresh(appid_order)
 
         self.update_status("Retry pass complete.")
         self.finish_scan()
@@ -649,6 +784,7 @@ class SteamSizeApp(tk.Tk):
                 size_bytes = size if isinstance(size, int) else ""
                 size_fmt = format_bytes(size) if isinstance(size, int) else "Unknown"
                 writer.writerow([name, appid, size_bytes, size_fmt])
+
 
 if __name__ == "__main__":
     app = SteamSizeApp()
