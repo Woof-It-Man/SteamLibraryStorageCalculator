@@ -16,7 +16,7 @@ except ImportError:
 
 # If steamcmd is not on your system PATH, set the full path to the executable here,
 # e.g. "/home/you/steamcmd/steamcmd.sh" or r"C:\steamcmd\steamcmd.exe"
-# Just download it frm valve's wiki and unpack it then path it to it.
+# Just download it from valve's wiki and unpack it then path it to it.
 # Leave as "steamcmd" to use whatever is on PATH.
 STEAMCMD_PATH = "steamcmd"
 
