@@ -14,6 +14,12 @@ try:
 except ImportError:
     vdf = None
 
+# If steamcmd is not on your system PATH, set the full path to the executable here,
+# e.g. "/home/you/steamcmd/steamcmd.sh" or r"C:\steamcmd\steamcmd.exe"
+# Just download it frm valve's wiki and unpack it then path it to it.
+# Leave as "steamcmd" to use whatever is on PATH.
+STEAMCMD_PATH = "steamcmd"
+
 STEAMCMD_CACHE_FILE = "steam_size_cache.json"
 ERROR_LOG_FILE = "steam_size_errors.log"
 AUTOSAVE_CSV = "steam_library_sizes_autosave.csv"
@@ -137,7 +143,7 @@ def get_size_from_steamcmd(appid, name):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             result = subprocess.run(
-                ["steamcmd", "+login", "anonymous", "+app_info_print", str(appid), "+quit"],
+                [STEAMCMD_PATH, "+login", "anonymous", "+app_info_print", str(appid), "+quit"],
                 capture_output=True,
                 text=True,
                 timeout=STEAMCMD_TIMEOUT,
@@ -382,9 +388,11 @@ class SteamSizeApp(tk.Tk):
                     self.update_status("ERROR: steamcmd not found on PATH.")
                     messagebox.showerror(
                         "steamcmd not found",
-                        "steamcmd is not installed or not on your PATH.\n\n"
+                        "steamcmd is not installed, not on your PATH, or STEAMCMD_PATH is set incorrectly.\n\n"
                         "Install it with:\nsudo add-apt-repository multiverse\n"
-                        "sudo apt update\nsudo apt install steamcmd",
+                        "sudo apt update\nsudo apt install steamcmd\n\n"
+                        "Or edit the STEAMCMD_PATH constant near the top of this script "
+                        "to point directly to the steamcmd executable.",
                     )
                     self.stop_requested = True
                     return
